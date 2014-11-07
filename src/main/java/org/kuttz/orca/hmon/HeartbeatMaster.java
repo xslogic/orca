@@ -45,8 +45,8 @@ public class HeartbeatMaster implements THeartbeatEndPoint.Iface, Runnable {
 	
 	public Map<HeartbeatNode, NodeState> registerClient(HeartbeatMasterClient client) {
 		registerClient(-1, NodeType.CONTAINER, client);
-		HashMap<HeartbeatNode,NodeState> retVal = new HashMap<HeartbeatNode, NodeState>();		
-		for (Entry<NodeType, ConcurrentHashMap<HeartbeatNode, NodeState>> e : nodeRegistry.entrySet()) {					
+		HashMap<HeartbeatNode,NodeState> retVal = new HashMap<HeartbeatNode, NodeState>();
+		for (Entry<NodeType, ConcurrentHashMap<HeartbeatNode, NodeState>> e : nodeRegistry.entrySet()) {
 			ConcurrentHashMap<HeartbeatNode,NodeState> m = e.getValue();
 			for (Entry<HeartbeatNode,NodeState> e2 : m.entrySet()) {
 				retVal.put(e2.getKey(), e2.getValue());
@@ -57,7 +57,7 @@ public class HeartbeatMaster implements THeartbeatEndPoint.Iface, Runnable {
 	
 	public void registerClient(int nodeId, NodeType nodeType, HeartbeatMasterClient client) {
 		Set<HeartbeatMasterClient> sTemp = new HashSet<HeartbeatMasterClient>();
-		Set<HeartbeatMasterClient> sClients = nodeClients.putIfAbsent(new HeartbeatNode(nodeId, nodeType), sTemp);		
+		Set<HeartbeatMasterClient> sClients = nodeClients.putIfAbsent(new HeartbeatNode(nodeId, nodeType), sTemp);
 		if (sClients == null) {
 			sClients = sTemp;
 		}

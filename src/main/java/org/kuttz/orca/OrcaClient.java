@@ -31,9 +31,10 @@ import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.YarnApplicationState;
 import org.apache.hadoop.yarn.api.records.YarnClusterMetrics;
-import org.apache.hadoop.yarn.client.YarnClientImpl;
+import org.apache.hadoop.yarn.client.api.YarnClientApplication;
+import org.apache.hadoop.yarn.client.api.impl.YarnClientImpl;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.exceptions.YarnRemoteException;
+import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
 import org.kuttz.orca.controller.OrcaControllerArgs;
@@ -74,9 +75,10 @@ public class OrcaClient extends YarnClientImpl{
 		this.conf = conf;
 		this.orcaArgs = orcaArgs;
 		init(this.conf);
+		start();
 	}
 	
-	public boolean run() throws IOException {
+	public boolean run() throws IOException, YarnException {
 		logger.info("Running Orca client..");
 		start();
 		
@@ -86,9 +88,9 @@ public class OrcaClient extends YarnClientImpl{
 		List<NodeReport> clusterNodeReports = super.getNodeReports();
 		logger.info("Got Cluster node info from ASM");
 		for (NodeReport node : clusterNodeReports) {
-		    logger.info("Got node report from ASM for" + ", nodeId=" + node.getNodeId() + ", nodeAddress"
-		            + node.getHttpAddress() + ", nodeRackName" + node.getRackName() + ", nodeNumContainers"
-		            + node.getNumContainers() + ", nodeHealthStatus" + node.getNodeHealthStatus());
+		    logger.info("Got node report from ASM for" + ", nodeId=" + node.getNodeId() + ", nodeAddress="
+		            + node.getHttpAddress() + ", nodeRackName=" + node.getRackName() + ", nodeNumContainers="
+		            + node.getNumContainers() + ", nodeHealthStatus=" + node.getHealthReport());
 		}
 
 		QueueInfo queueInfo = super.getQueueInfo("default");
@@ -106,7 +108,8 @@ public class OrcaClient extends YarnClientImpl{
 		}
 
 		// Get a new application id
-		GetNewApplicationResponse newApp = super.getNewApplication();
+		YarnClientApplication app = super.createApplication();
+		GetNewApplicationResponse newApp = app.getNewApplicationResponse();
 		ApplicationId appId = newApp.getApplicationId();
 
 		// TODO get min/max resource capabilities from RM and change memory ask if needed
@@ -114,14 +117,14 @@ public class OrcaClient extends YarnClientImpl{
 		// the required resources from the RM for the app master
 		// Memory ask has to be a multiple of min and less than max.
 		// Dump out information about cluster capability as seen by the resource manager
-		int minMem = newApp.getMinimumResourceCapability().getMemory();
 		int maxMem = newApp.getMaximumResourceCapability().getMemory();
-		logger.info("Min mem capability of resources in this cluster " + minMem);
 		logger.info("Max mem capability of resources in this cluster " + maxMem);		
 		
 		logger.info("Setting up application submission context for ASM");
-		ApplicationSubmissionContext appContext = Records.newRecord(ApplicationSubmissionContext.class);
+		ApplicationSubmissionContext appContext = app.getApplicationSubmissionContext();
+//		ApplicationSubmissionContext appContext = Records.newRecord(ApplicationSubmissionContext.class);
 
+		appContext.setKeepContainersAcrossApplicationAttempts(true);
 		// set the application id
 		appContext.setApplicationId(appId);
 		// set the application name
@@ -226,7 +229,7 @@ public class OrcaClient extends YarnClientImpl{
 		// For now, only memory is supported so we set memory requirements
 		Resource capability = Records.newRecord(Resource.class);
 		capability.setMemory(orcaArgs.containerMemory);
-		amContainer.setResource(capability);
+		appContext.setResource(capability);
 
 		appContext.setAMContainerSpec(amContainer);
 		
@@ -238,9 +241,6 @@ public class OrcaClient extends YarnClientImpl{
 
 		// Set the queue to which this application is to be submitted in the RM
 		appContext.setQueue("default");
-		// Set the user submitting this application
-		// TODO can it be empty?
-		appContext.setUser(orcaArgs.user);
 
 		// TODO : DO some Orca specific stuff 
 
@@ -256,7 +256,7 @@ public class OrcaClient extends YarnClientImpl{
 		return monitorApplication(appId);
 	}
 	
-	private boolean monitorApplication(ApplicationId appId) throws YarnRemoteException {
+	private boolean monitorApplication(ApplicationId appId) throws YarnException, IOException {
 		
 		int numRunning = 5;
 		
@@ -270,7 +270,7 @@ public class OrcaClient extends YarnClientImpl{
 			// Get application report for the appId we are interested in
 			ApplicationReport report = super.getApplicationReport(appId);
 			logger.info("Got application report from ASM for" + ", appId=" + appId.getId() + ", clientToken="
-			         + report.getClientToken() + ", appDiagnostics=" + report.getDiagnostics() + ", appMasterHost="
+			         + report.getClientToAMToken() + ", appDiagnostics=" + report.getDiagnostics() + ", appMasterHost="
 			         + report.getHost() + ", appQueue=" + report.getQueue() + ", appMasterRpcPort="
 			         + report.getRpcPort() + ", appStartTime=" + report.getStartTime() + ", yarnAppState="
 			         + report.getYarnApplicationState().toString() + ", distributedFinalState="
@@ -315,9 +315,12 @@ public class OrcaClient extends YarnClientImpl{
 	private Path copyToLocalResources(ApplicationId appId, FileSystem fs, Map<String, LocalResource> localResources,
 	        File file) throws IOException {
 	    Path src = new Path(file.getAbsolutePath());
+	    logger.info("Copying resources SRC dir : " + src);
 
 	    // TODO use home directory + appId / appName?
 	    Path dst = new Path(new Path(fs.getHomeDirectory(), "/app-" + appId.getId()), file.getName());
+	    logger.info("Copying resources DEST dir : " + dst);
+	    logger.info("Filesystem : " + fs.getScheme());
 	    fs.copyFromLocalFile(false, true, src, dst);
 	    FileStatus destStatus = fs.getFileStatus(dst);
 	    LocalResource resource = Records.newRecord(LocalResource.class);

@@ -1,6 +1,8 @@
 package org.kuttz.orca.proxy;
 
 import java.net.InetSocketAddress;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.jboss.netty.bootstrap.ClientBootstrap;
 import org.jboss.netty.buffer.ChannelBuffer;
@@ -15,6 +17,7 @@ import org.jboss.netty.channel.MessageEvent;
 import org.jboss.netty.channel.SimpleChannelUpstreamHandler;
 import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
 import org.kuttz.orca.proxy.ELB.ELBNode;
+import org.kuttz.orca.proxy.ELB.Stats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,8 +33,8 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
     // This lock guards against the race condition that overrides the
     // OP_READ flag incorrectly.
     // See the related discussion: http://markmail.org/message/x7jc6mqx6ripynqf
-    final Object trafficLock = new Object();	
-	
+    final Object trafficLock = new Object();
+
 	public ELBInboundHandler(ClientSocketChannelFactory cf, ELB elb) {
 		this.cf = cf;
 		this.elb = elb;
@@ -46,14 +49,25 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 		
 		ClientBootstrap cb = new ClientBootstrap(cf);
 		cb.getPipeline().addLast("handler", new OutboundHandler(e.getChannel()));
-		ELBNode nextNode = elb.nextNode();
+		final ELBNode nextNode = elb.nextNode();
 		logger.info("\nRouting to [" + nextNode + "]\n");
+		Stats stats = elb.nodeStats.get(nextNode);
+		if (stats == null) {
+		  stats = new Stats();
+		  elb.nodeStats.put(nextNode, stats);
+		}
+		stats.outstanding++;
+		stats.total++;
+		elb.updateNodeStats();
 		ChannelFuture f = cb.connect(new InetSocketAddress(nextNode.host, nextNode.port));
 		outboundChannel = f.getChannel();
 		
+		ctx.setAttachment(stats);
 		f.addListener(new ChannelFutureListener() {			
 			@Override
 			public void operationComplete(ChannelFuture future) throws Exception {
+	          logger.info("IB Channel operationComplete [" + elb.nodeStats.get(nextNode) + "]");
+			    elb.updateNodeStats();
 				if (future.isSuccess()) {
 					inboundChannel.setReadable(true);
 				} else {
@@ -68,6 +82,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 	@Override
 	public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
 			throws Exception {
+      logger.info("IB Channel messageReceived [" + ctx.getAttachment() + "]");
 		ChannelBuffer msg = (ChannelBuffer) e.getMessage();
 		synchronized (trafficLock) {
 			outboundChannel.write(msg);
@@ -85,6 +100,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 			ChannelStateEvent e) throws Exception {
         // If inboundChannel is not saturated anymore, continue accepting
         // the incoming traffic from the outboundChannel.		
+      logger.info("IB Channel channelInterestChanged [" + ctx.getAttachment() + "]");
 		synchronized (trafficLock) {
 			if (e.getChannel().isWritable()) {
 				if (outboundChannel != null) {
@@ -97,6 +113,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 	@Override
 	public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
 			throws Exception {
+      logger.info("IB Channel channelClosed [" + ctx.getAttachment() + "]");
 		if (outboundChannel != null) {
 			closeOnFlush(outboundChannel);
 		}
@@ -122,6 +139,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 		public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
 				throws Exception {
             ChannelBuffer msg = (ChannelBuffer) e.getMessage();
+            logger.info("OB Channel messageReceived [" + ctx.getAttachment() + "]");
             synchronized (trafficLock) {
                 inboundChannel.write(msg);
                 // If inboundChannel is saturated, do not read until notified in
@@ -136,6 +154,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 				ChannelStateEvent e) throws Exception {
 			// If outboundChannel is not saturated anymore, continue accepting
             // the incoming traffic from the inboundChannel.
+          logger.info("OB Channel channelInterestChanged [" + ctx.getAttachment() + "]");
             synchronized (trafficLock) {
                 if (e.getChannel().isWritable()) {
                     inboundChannel.setReadable(true);
@@ -146,6 +165,7 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 		@Override
 		public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
 				throws Exception {
+          logger.info("OB Channel channelClosed [" + ctx.getAttachment() + "]");
 			closeOnFlush(inboundChannel);
 		}		
 		

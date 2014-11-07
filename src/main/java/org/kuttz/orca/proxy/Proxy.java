@@ -1,6 +1,7 @@
 package org.kuttz.orca.proxy;
 
 import java.io.IOException;
+import java.util.HashMap;import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -10,9 +11,12 @@ import org.apache.thrift.server.TNonblockingServer;
 import org.apache.thrift.transport.TFramedTransport;
 import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TNonblockingServerTransport;
+import org.codehaus.jettison.json.JSONArray;
 import org.kuttz.orca.hmon.HBSlaveArgs;
 import org.kuttz.orca.hmon.HeartbeatSlave;
 import org.kuttz.orca.hmon.NodeInfo;
+import org.kuttz.orca.proxy.ELB.ELBNode;
+import org.kuttz.orca.proxy.ELB.Stats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -44,6 +48,21 @@ public class Proxy implements Runnable, TProxyCommandEndPoint.Iface {
 		this.hbSlave.init();
 		this.orcaELB.init();
 		exService = Executors.newCachedThreadPool();		
+	}
+
+	public void updateNodeStats() {
+	  Map<ELBNode, Stats> hashedMap = new HashMap<ELBNode, Stats>(orcaELB.nodeStats);
+	  JSONArray jResp = new JSONArray();
+//	  List<Map<String,String>> l = new LinkedList<Map<String, String>>();
+	  for (Map.Entry<ELBNode, Stats> e : hashedMap.entrySet()) {
+	    String node = e.getKey().host + ":" + e.getKey().port;
+	    Map<String, String> nInfo = new HashMap<String, String>();
+	    nInfo.put("node", node);
+	    nInfo.put("outstanding", "" + e.getValue().outstanding);
+	    nInfo.put("total", "" + e.getValue().total);
+	    jResp.put(nInfo);
+	  }
+	  this.nodeInfo.setInfoJson(jResp.toString());
 	}
 
 	@Override

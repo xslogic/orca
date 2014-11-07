@@ -35,7 +35,7 @@ import org.slf4j.LoggerFactory;
 
 public class OrcaController implements Runnable {
 	
-	private static Logger logger = LoggerFactory.getLogger(OrcaController.class);		
+	private static Logger logger = LoggerFactory.getLogger(OrcaController.class);
 	
 	private LinkedBlockingQueue<ClientRequest> inQ = new LinkedBlockingQueue<ClientRequest>();
 	private LinkedBlockingQueue<ControllerRequest> outQ = new LinkedBlockingQueue<ControllerRequest>();
@@ -68,7 +68,40 @@ public class OrcaController implements Runnable {
 	public ControllerRequest getNextRequest() throws InterruptedException {
 		return this.outQ.take();
 	}
-		
+	
+	public String getProxyURL() {
+	  if (elbHandler != null) {
+	    if (elbHandler.state.equals(SlaveState.NODE_RUNNING)) {
+	      return "http://" + elbHandler.elbHost + ":" + elbHandler.elbPort + "/" + ocArgs.appName;
+	    }
+	  }
+	  return "";
+	}
+	
+	public List<String> getContainerInfo() {
+	  List<String> retList = new ArrayList<String>();
+	  for (SlaveHandler slave : slaves) {
+	    if (slave instanceof ContainerSlaveHandler) {
+	      retList.add(slave.sHost + ":" + ((ContainerSlaveHandler)slave).getRunningPort());
+	    }
+	  }
+	  return retList;
+	}
+	
+	public String getProxyStats() {
+	  if (elbHandler != null) {
+	    if (elbHandler.state.equals(SlaveState.NODE_RUNNING)) {
+	      if (elbHandler.slaveNode != null) {
+	        NodeState nodeState = hbMaster.getNodeState(elbHandler.slaveNode.getId(), NodeType.PROXY);
+	        if ((nodeState != null) && (nodeState.nodeInfo != null)) {
+	          return nodeState.nodeInfo.getInfoJson();
+	        }
+	      }
+	    }
+	  }
+	  return "";
+	}
+	
 	public int getProxyPort() {
 		if (elbHandler != null) {
 			if (elbHandler.state.equals(SlaveState.NODE_RUNNING)) {
@@ -86,6 +119,7 @@ public class OrcaController implements Runnable {
 		}
 		return "";
 	}
+	
 	
 	public void scaleUpBy(int numContainers) {
 		this.inQ.add(new ClientRequest(numContainers));
@@ -124,7 +158,7 @@ public class OrcaController implements Runnable {
 					if (slave.getSlaveState().equals(SlaveState.NOT_STARTED)) {
 						slave.askForNode();
 					}
-				}				
+				}
 			}
 			
 			ClientRequest req = null;
@@ -134,7 +168,7 @@ public class OrcaController implements Runnable {
 				// Dont Care
 			}
 			if (req != null) {
-				handleClientRequest(req);			
+				handleClientRequest(req);
 			}
 		}		
 	}
@@ -157,7 +191,7 @@ public class OrcaController implements Runnable {
 	private ELBArgs createELBLaunchArgs(OrcaControllerArgs ocArgs) {
 		ELBArgs elbArgs = new ELBArgs();
 		elbArgs.maxPort = ocArgs.elbMaxPort;
-		elbArgs.minPort = ocArgs.elbMinPort;		
+		elbArgs.minPort = ocArgs.elbMinPort;
 		return elbArgs;
 	}
 
@@ -166,11 +200,11 @@ public class OrcaController implements Runnable {
 	}
 	
 	public int getNumRunningContainers() {
-		return this.numContainersRunning.get();		
+		return this.numContainersRunning.get();
 	}
 	
 	public int getNumContainersDied() {
-		return this.numContainersDied.get();		
+		return this.numContainersDied.get();
 	}
 	
 	public void kill() {
@@ -299,7 +333,7 @@ public class OrcaController implements Runnable {
 		}
 		
 		public void askForNode() {
-			ControllerRequest req = new ControllerRequest(this);			
+			ControllerRequest req = new ControllerRequest(this);
 			OrcaController.this.outQ.add(req);
 			this.state = SlaveState.NODE_REQUESTED;
 		}

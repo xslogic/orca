@@ -2,6 +2,8 @@ package org.kuttz.orca.proxy;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.TreeSet;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -28,6 +30,16 @@ public class ELB implements Runnable {
 	
 	private final Proxy container;
 	
+    public Map<ELBNode, Stats> nodeStats = new HashMap<ELBNode, Stats>();
+    
+    static class Stats {
+      public int outstanding;
+      public int total;
+    }
+
+    public void updateNodeStats() {
+      container.updateNodeStats();
+    }
 
 	public ELB(ELBArgs args, Proxy container) {
 		this.elbArgs = args;

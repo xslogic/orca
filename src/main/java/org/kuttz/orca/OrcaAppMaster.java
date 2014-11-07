@@ -10,11 +10,11 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
@@ -25,34 +25,32 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RemoteIterator;
-import org.apache.hadoop.net.NetUtils;
-import org.apache.hadoop.security.UserGroupInformation;
-import org.apache.hadoop.yarn.api.AMRMProtocol;
-import org.apache.hadoop.yarn.api.ApplicationConstants;
-import org.apache.hadoop.yarn.api.ContainerManager;
-import org.apache.hadoop.yarn.api.protocolrecords.AllocateRequest;
+import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
 import org.apache.hadoop.yarn.api.protocolrecords.AllocateResponse;
-import org.apache.hadoop.yarn.api.protocolrecords.FinishApplicationMasterRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.RegisterApplicationMasterRequest;
 import org.apache.hadoop.yarn.api.protocolrecords.RegisterApplicationMasterResponse;
-import org.apache.hadoop.yarn.api.protocolrecords.StartContainerRequest;
-import org.apache.hadoop.yarn.api.records.AMResponse;
 import org.apache.hadoop.yarn.api.records.ApplicationAttemptId;
 import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerLaunchContext;
+import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.FinalApplicationStatus;
 import org.apache.hadoop.yarn.api.records.LocalResource;
 import org.apache.hadoop.yarn.api.records.LocalResourceType;
 import org.apache.hadoop.yarn.api.records.LocalResourceVisibility;
+import org.apache.hadoop.yarn.api.records.NodeReport;
 import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.api.records.Resource;
-import org.apache.hadoop.yarn.api.records.ResourceRequest;
+import org.apache.hadoop.yarn.client.api.AMRMClient;
+import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest;
+import org.apache.hadoop.yarn.client.api.NMClient;
+import org.apache.hadoop.yarn.client.api.NMTokenCache;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
-import org.apache.hadoop.yarn.exceptions.YarnRemoteException;
-import org.apache.hadoop.yarn.ipc.YarnRPC;
+import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
+import org.codehaus.jettison.json.JSONArray;
+import org.codehaus.jettison.json.JSONException;
 import org.codehaus.jettison.json.JSONObject;
 import org.kuttz.orca.controller.OrcaController;
 import org.kuttz.orca.controller.OrcaController.ControllerRequest;
@@ -78,18 +76,11 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	private final OrcaControllerArgs orcaArgs;
 	
 	private OrcaController oc;
-	
-	// Incremental counter for rpc calls to the RM
-	private final AtomicInteger rmRequestID = new AtomicInteger();	
-	
 	// Configuration
 	private Configuration conf;
 
-	// YARN RPC to communicate with the Resource Manager or Node Manager
-	private YarnRPC rpc;
-
 	// Handle to communicate with the Resource Manager
-	private AMRMProtocol resourceManager;
+	private AMRMClient<ContainerRequest> resourceManager;
 
 	// Application Attempt Id ( combination of attemptId and fail count )
 	private ApplicationAttemptId appAttemptID;
@@ -110,6 +101,10 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	private RequestContainerRunnable requester = new RequestContainerRunnable();
 	
 	private TrackingService trackingService = new TrackingService();
+	
+	private NMClient nmClient;
+	
+	private Random rnd;
 	
 	@Override
 	public HeartbeatMasterClient getHeartbeatClient() {
@@ -151,10 +146,10 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		Map<String, String> envs = System.getenv();
 		
 		appAttemptID = Records.newRecord(ApplicationAttemptId.class);
-		if (!envs.containsKey(ApplicationConstants.AM_CONTAINER_ID_ENV)) {
+		if (!envs.containsKey(Environment.CONTAINER_ID.name())) {
 			throw new IllegalArgumentException("Application Attempt Id not set in the environment");
 		} else {
-		    ContainerId containerId = ConverterUtils.toContainerId(envs.get(ApplicationConstants.AM_CONTAINER_ID_ENV));
+		    ContainerId containerId = ConverterUtils.toContainerId(envs.get(Environment.CONTAINER_ID.name()));
 		    appAttemptID = containerId.getApplicationAttemptId();
 		}		
 		
@@ -162,15 +157,14 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		        + ", clustertimestamp=" + appAttemptID.getApplicationId().getClusterTimestamp() + ", attemptId="
 		        + appAttemptID.getAttemptId());
 
-		conf = new YarnConfiguration();
-		rpc = YarnRPC.create(conf);		
+		conf = new YarnConfiguration();	
 		
 		this.tp.submit(requester);
 		this.tp.submit(trackingService);
 		this.oc = new OrcaController(this.orcaArgs, this);
 	}
 	
-	public void run() throws YarnRemoteException {
+	public void run() {
 		logger.info("Starting ApplicationMaster");
 		
 		oc.init();
@@ -178,19 +172,29 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		
 		// Connect to ResourceManager
 		resourceManager = connectToRM();
+		
+		nmClient = NMClient.createNMClient();
+		nmClient.setNMTokenCache(NMTokenCache.getSingleton());
+		nmClient.init(conf);
+		nmClient.start();
 
 		// Setup local RPC Server to accept status requests directly from clients
 		// TODO need to setup a protocol for client to be able to communicate to the RPC server
 		// TODO use the rpc port info to register with the RM for the client to
 		// send requests to this app master
 
+		RegisterApplicationMasterResponse response = null;
+		try {
+		  response = registerToRM();
+		} catch (Exception e) {
+	        logger.error("Got exception when trying to register with RM !!", e);
+	        System.exit(-1);
+		}
 		// Register self with ResourceManager
-		RegisterApplicationMasterResponse response = registerToRM();
 		// Dump out information about cluster capability as seen by the resource
 		// manager
-		int minMem = response.getMinimumResourceCapability().getMemory();
 		int maxMem = response.getMaximumResourceCapability().getMemory();
-		logger.info("Min mem capability of resources in this cluster " + minMem);
+		
 		logger.info("Max mem capability of resources in this cluster " + maxMem);
 
 		// A resource ask has to be atleast the minimum of the capability of the
@@ -198,11 +202,7 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		// a multiple of the min value and cannot exceed the max.
 		// If it is not an exact multiple of min, the RM will allocate to the
 		// nearest multiple of min
-		if (containerMemory < minMem) {
-			logger.info("Container memory for Orca node specified below min threshold of YARN cluster. Using min value."
-					+ ", specified=" + containerMemory + ", min=" + minMem);
-			containerMemory = minMem;
-		} else if (containerMemory > maxMem) {
+		if (containerMemory > maxMem) {
 			logger.info("Container memory for Orca node specified above max threshold of YARN cluster. Using max value."
 					+ ", specified=" + containerMemory + ", max=" + maxMem);
 			containerMemory = maxMem;
@@ -238,28 +238,17 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	 * @param requestedContainers
 	 *            Containers to ask for from RM
 	 * @return Response from RM to AM with allocated containers
+	 * @throws IOException 
+	 * @throws YarnException 
 	 * @throws YarnRemoteException
 	 */
-	private AMResponse sendContainerAskToRM(List<ResourceRequest> requestedContainers) throws YarnRemoteException {
-	    AllocateRequest req = Records.newRecord(AllocateRequest.class);
-	    req.setResponseId(rmRequestID.incrementAndGet());
-	    req.setApplicationAttemptId(appAttemptID);
-	    req.addAllAsks(requestedContainers);
-	    req.addAllReleases(releasedContainers);
-//	    req.setProgress((float) numCompletedContainers.get() / orcaArgs.numContainers);
+	private AllocateResponse sendContainerAskToRM(List<ContainerRequest> requestedContainers) throws YarnException, IOException {
+	    logger.info("Sending request to RM for containers [" + requestedContainers.size() + "]");
 
-	    logger.info("Sending request to RM for containers" + ", requestedSet=" + requestedContainers.size()
-	            + ", releasedSet=" + releasedContainers.size() + ", progress=" + req.getProgress());
-
-	    for (ResourceRequest rsrcReq : requestedContainers) {
-	        logger.info("Requested container ask: " + rsrcReq.toString());
+	    for (ContainerRequest cr : requestedContainers) {
+	      resourceManager.addContainerRequest(cr);
 	    }
-	    for (ContainerId id : releasedContainers) {
-	        logger.info("Released container, id=" + id.getId());
-	    }
-
-	    AllocateResponse resp = resourceManager.allocate(req);
-	    return resp.getAMResponse();
+	    return resourceManager.allocate(50);
 	}	
 	
 	/**
@@ -269,32 +258,28 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	 *            Containers to ask for from RM
 	 * @return the setup ResourceRequest to be sent to RM
 	 */
-	private ResourceRequest setupContainerAskForRM(int numContainers) {
-	    ResourceRequest request = Records.newRecord(ResourceRequest.class);
-
-	    // setup requirements for hosts
-	    // whether a particular rack/host is needed
-	    // Refer to apis under org.apache.hadoop.net for more
-	    // details on how to get figure out rack/host mapping.
-	    // using * as any host will do for the distributed shell app
-	    request.setHostName("*");
-
-	    // set no. of containers needed
-	    request.setNumContainers(numContainers);
-
-	    // set the priority for the request
-	    Priority pri = Records.newRecord(Priority.class);
-	    // TODO - what is the range for priority? how to decide?
-	    pri.setPriority(0);
-	    request.setPriority(pri);
-
-	    // Set up resource type requirements
-	    // For now, only memory is supported so we set memory requirements
-	    Resource capability = Records.newRecord(Resource.class);
-	    capability.setMemory(containerMemory);
-	    request.setCapability(capability);
-
-	    return request;
+	private List<ContainerRequest> setupContainerAskForRM(int numContainers, List<NodeReport> nodeReport) {
+      // set the priority for the request
+	  List<ContainerRequest> retList = new ArrayList<ContainerRequest>();
+	  
+//	  if (nodeReport == null) {
+//	    nodeReport = new ArrayList<NodeReport>();
+//	  }
+//	  int numNodes = nodeReport.size();
+//	  int startNode = -1;
+//	  if (numNodes > 0) {
+//	    startNode = rnd.nextInt(numNodes);
+//	  }
+	  
+	  for (int i = 0; i < numContainers; i++) {
+	      Priority pri = Priority.newInstance(0);
+	      Resource capability = Resource.newInstance(containerMemory, 1);
+//	      String[] host = (numNodes > 0) ? new String[] {nodeReport.get(startNode).getNodeId().getHost()} : null; 
+	      ContainerRequest contReq = new ContainerRequest(capability, null, null, pri);
+	      retList.add(contReq);
+//	      startNode = (startNode + 1) % numNodes;
+	  }
+	  return retList;
 	}		
 	
 	/**
@@ -302,21 +287,29 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	 * 
 	 * @return Handle to communicate with the RM
 	 */
-	private AMRMProtocol connectToRM() {
+	private AMRMClient<ContainerRequest> connectToRM() {
 	    YarnConfiguration yarnConf = new YarnConfiguration(conf);
 	    InetSocketAddress rmAddress = yarnConf.getSocketAddr(YarnConfiguration.RM_SCHEDULER_ADDRESS,
 	            YarnConfiguration.DEFAULT_RM_SCHEDULER_ADDRESS, YarnConfiguration.DEFAULT_RM_SCHEDULER_PORT);
 	    logger.info("Connecting to ResourceManager at " + rmAddress);
-	    return ((AMRMProtocol) rpc.getProxy(AMRMProtocol.class, rmAddress, conf));
+	    AMRMClient<ContainerRequest> amRMClient = AMRMClient.createAMRMClient();
+	    amRMClient.setNMTokenCache(NMTokenCache.getSingleton());
+	    amRMClient.init(yarnConf);
+	    amRMClient.start();
+	    return amRMClient;
+//	    return ((AMRMProtocol) rpc.getProxy(AMRMProtocol.class, rmAddress, conf));
 	}	
 	
 	/**
 	 * Register the Application Master to the Resource Manager
 	 * 
 	 * @return the registration response from the RM
+	 * @throws IOException 
+	 * @throws YarnException 
+	 * @throws UnknownHostException 
 	 * @throws YarnRemoteException
 	 */
-	private RegisterApplicationMasterResponse registerToRM() throws YarnRemoteException {
+	private RegisterApplicationMasterResponse registerToRM() throws UnknownHostException, YarnException, IOException {
 	    RegisterApplicationMasterRequest appMasterRequest = Records.newRecord(RegisterApplicationMasterRequest.class);
 
 	    // set the required info into the registration request:
@@ -324,7 +317,7 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	    // host on which the app master is running
 	    // rpc port on which the app master accepts requests from the client
 	    // tracking url for the app master
-	    appMasterRequest.setApplicationAttemptId(appAttemptID);
+//	    appMasterRequest.setApplicationAttemptId(appAttemptID);
 	    appMasterRequest.setHost(appMasterHostname);
 	    appMasterRequest.setRpcPort(appMasterRpcPort);
 	    try {
@@ -333,18 +326,16 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 			logger.error("Got error retriving hostname !!", e);
 		}
 
-	    return resourceManager.registerApplicationMaster(appMasterRequest);
+	    return resourceManager.registerApplicationMaster(appMasterHostname, appMasterRpcPort, trackingService.getTrackingUrl());
 	}
 	
-	private void killApp() throws YarnRemoteException {
+	private void killApp() throws YarnException, IOException {
 	    // When the application completes, it should send a finish application signal
 	    // to the RM
 	    logger.info("Application completed. Signalling finish to RM");
 
-	    FinishApplicationMasterRequest finishReq = Records.newRecord(FinishApplicationMasterRequest.class);
-	    finishReq.setAppAttemptId(appAttemptID);
-	    finishReq.setFinishApplicationStatus(FinalApplicationStatus.KILLED);
-	    resourceManager.finishApplicationMaster(finishReq);
+	    nmClient.stop();
+	    resourceManager.unregisterApplicationMaster(FinalApplicationStatus.KILLED, "APP Ended", null);
 	}
 
 	@Override
@@ -387,40 +378,56 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		@Override
 		
 		public void run() {
+		    List<NodeReport> updatedNodes = null;
 			while (true) {
 				if (inQ.size() != 0) {
 					LinkedList<ControllerRequest> outstanding = new LinkedList<ControllerRequest>();
 					inQ.drainTo(outstanding);
-					List<ResourceRequest> resourceReq = new ArrayList<ResourceRequest>();
-					ResourceRequest containerAsk = OrcaAppMaster.this.setupContainerAskForRM(outstanding.size());
-					resourceReq.add(containerAsk);
+					List<ContainerRequest> containerReqs = OrcaAppMaster.this.setupContainerAskForRM(outstanding.size(), updatedNodes);
 					
 					// Send request to RM
 					logger.info("Asking RM for a container !!");
-					AMResponse amResp = null;
-					try {
-						amResp = sendContainerAskToRM(resourceReq);
-					} catch (YarnRemoteException e) {						
-						logger.error("Got Exception while requesting Container !!", e);
-						if (exCount++ > 10) {
-							System.exit(-1);
-						}
-					}
 					// Retrieve list of allocated containers from the response
-					List<Container> allocatedContainers = amResp.getAllocatedContainers();					
-					logger.info("Got response from RM for container ask, allocatedCnt=" + allocatedContainers.size());
-					for (Container allocatedContainer : allocatedContainers) {
+					AllocateResponse allocResp = null;
+					try {
+					  allocResp = sendContainerAskToRM(containerReqs);
+					} catch (Exception e) {
+					  logger.info("Got Error response when sending containerAsk !!", allocResp);
+					}
+					logger.info("Got response from RM for container ask, allocatedCnt=" + allocResp.getAllocatedContainers().size());
+					for (Container allocatedContainer : allocResp.getAllocatedContainers()) {
 						ControllerRequest req = outstanding.poll();
 						if (req != null) {
-							req.setResponse(new ContainerNode(allocatedContainer));							
+							req.setResponse(new ContainerNode(allocatedContainer));	
 						}
+					}
+					updatedNodes = allocResp.getUpdatedNodes();
+					List<ContainerStatus> completedContainersStatuses = allocResp.getCompletedContainersStatuses();
+					for (ContainerStatus compContStat : completedContainersStatuses) {
+					  releasedContainers.add(compContStat.getContainerId());
 					}
 					while (outstanding.size() > 0) {
 						inQ.add(outstanding.poll());
 					}
+					String proxyStats = OrcaAppMaster.this.oc.getProxyStats();
+					try {
+					  JSONArray containerStats = new JSONArray(proxyStats);
+					  if (containerStats != null) {
+					    for (int i = 0; i < containerStats.length(); i ++) {
+					      Map stat = (Map)containerStats.get(i);
+					      int inProgress = Integer.parseInt((String)stat.get("outstanding"));
+					      if (inProgress > 1) {
+					        oc.scaleUpBy(1);
+					        break;
+					      }
+					    }
+					  }
+					} catch (Exception e) {
+					  logger.info("Got error while getting container stats <" + proxyStats + ">!!", e);
+					}
 				}
 				try {
-					Thread.sleep(2000);
+					Thread.sleep(1000);
 				} catch (InterruptedException e) {
 					// Don't care..
 				}
@@ -434,8 +441,6 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		final OrcaLaunchContext launchContext;
 	    // Allocated container
 	    final Container container;
-	    // Handle to communicate with ContainerManager
-	    ContainerManager cm;
 
 	    /**
 	     * @param lcontainer
@@ -449,36 +454,26 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	    /**
 	     * Helper function to connect to CM
 	     */
-	    private void connectToCM() {
-	        logger.debug("Connecting to ContainerManager for containerid=" + container.getId());
-	        String cmIpPortStr = container.getNodeId().getHost() + ":" + container.getNodeId().getPort();
-	        InetSocketAddress cmAddress = NetUtils.createSocketAddr(cmIpPortStr);
-	        logger.info("Connecting to ContainerManager at " + cmIpPortStr);
-	        this.cm = ((ContainerManager) rpc.getProxy(ContainerManager.class, cmAddress, conf));
-	    }
+//	    private void connectToCM() {
+//	      logger.debug("Connecting to ContainerManager for containerid=" + container.getId());
+//	        NMClient nmClient = NMClient.createNMClient();
+//	        nmClient.init(conf);
+//	        container.
+//	        String cmIpPortStr = container.getNodeId().getHost() + ":" + container.getNodeId().getPort();
+//	        InetSocketAddress cmAddress = NetUtils.createSocketAddr(cmIpPortStr);
+//	        logger.info("Connecting to ContainerManager at " + cmIpPortStr);
+//	        this.cm = ((ContainerManager) rpc.getProxy(ContainerManager.class, cmAddress, conf));
+//	    }
 	    
 
 
 		@Override
 		public void run() {
-	        // Connect to ContainerManager
-	        connectToCM();
 
 	        logger.info("Setting up container launch container for containerid=" + container.getId());
 	        ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
-
-	        ctx.setContainerId(container.getId());
-	        ctx.setResource(container.getResource());
-	        
-	        try {
-				logger.info("Using default user name {}", UserGroupInformation.getCurrentUser().getShortUserName());
-				ctx.setUser(UserGroupInformation.getCurrentUser().getShortUserName());
-	        } catch (IOException e) {
-	            logger.info("Getting current user info failed when trying to launch the container" + e.getMessage());
-	        }
-	        
 	        // Set the local resources
-	        Map<String, LocalResource> localResources = new HashMap<String, LocalResource>();	        
+	        Map<String, LocalResource> localResources = new HashMap<String, LocalResource>();
 	        
 	        try {
 	            FileSystem fs = FileSystem.get(conf);
@@ -499,8 +494,7 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	            ctx.setLocalResources(localResources);
 
 	        } catch (IOException e1) {
-	            // TODO Auto-generated catch block
-	            e1.printStackTrace();
+	            logger.error("Got error when setting LocalResource !!", e1);
 	        }
 
 	        StringBuilder classPathEnv = new StringBuilder("${CLASSPATH}:./*");
@@ -521,15 +515,11 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	        commands.add(launchContext.getShellCommand());
 	        ctx.setCommands(commands);
 
-	        StartContainerRequest startReq = Records.newRecord(StartContainerRequest.class);
-	        startReq.setContainerLaunchContext(ctx);
 	        try {
-	            cm.startContainer(startReq);
-	        } catch (YarnRemoteException e) {
-	            logger.info("Start container failed for :" + ", containerId=" + container.getId());
-	            e.printStackTrace();
+	          nmClient.startContainer(container, ctx);
+	        } catch (Exception e) {
+	          logger.error("Got exception when trying to start Container !!", e);
 	        }
-	        
 		}
 	}
 	
@@ -592,13 +582,14 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 	        Request base_request = (request instanceof Request) ? (Request)request : HttpConnection.getCurrentConnection().getRequest();
 	        base_request.setHandled(true);
 	        
-	        JSONObject jResp = new JSONObject();	        
+	        JSONObject jResp = new JSONObject();
 	        try {
 	        	if (target.endsWith("status")) {
 	        		jResp.put("num_containers_running", OrcaAppMaster.this.oc.getNumRunningContainers());
 					jResp.put("num_containers_died", OrcaAppMaster.this.oc.getNumContainersDied());
-					jResp.put("proxy_host", OrcaAppMaster.this.oc.getProxyHost());
-					jResp.put("proxy_port", new Integer(OrcaAppMaster.this.oc.getProxyPort()));					
+					jResp.put("proxy_url", OrcaAppMaster.this.oc.getProxyURL());
+					jResp.put("container_info", OrcaAppMaster.this.oc.getContainerInfo());
+					jResp.put("container_stats", new JSONArray(OrcaAppMaster.this.oc.getProxyStats()));
 	        	} else if (target.endsWith("kill")) {
 	        		OrcaAppMaster.this.oc.kill();
 	        		Thread.sleep(5000);
@@ -620,5 +611,5 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		}
 		
 	}
-	
+
 }
