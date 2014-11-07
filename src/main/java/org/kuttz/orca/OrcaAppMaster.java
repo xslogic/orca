@@ -50,7 +50,6 @@ import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.hadoop.yarn.util.Records;
 import org.codehaus.jettison.json.JSONArray;
-import org.codehaus.jettison.json.JSONException;
 import org.codehaus.jettison.json.JSONObject;
 import org.kuttz.orca.controller.OrcaController;
 import org.kuttz.orca.controller.OrcaController.ControllerRequest;
@@ -378,59 +377,63 @@ public class OrcaAppMaster implements OrcaControllerClient, HeartbeatMasterClien
 		@Override
 		
 		public void run() {
-		    List<NodeReport> updatedNodes = null;
 			while (true) {
-				if (inQ.size() != 0) {
-					LinkedList<ControllerRequest> outstanding = new LinkedList<ControllerRequest>();
-					inQ.drainTo(outstanding);
-					List<ContainerRequest> containerReqs = OrcaAppMaster.this.setupContainerAskForRM(outstanding.size(), updatedNodes);
-					
-					// Send request to RM
-					logger.info("Asking RM for a container !!");
-					// Retrieve list of allocated containers from the response
-					AllocateResponse allocResp = null;
-					try {
-					  allocResp = sendContainerAskToRM(containerReqs);
-					} catch (Exception e) {
-					  logger.info("Got Error response when sending containerAsk !!", allocResp);
-					}
-					logger.info("Got response from RM for container ask, allocatedCnt=" + allocResp.getAllocatedContainers().size());
-					for (Container allocatedContainer : allocResp.getAllocatedContainers()) {
-						ControllerRequest req = outstanding.poll();
-						if (req != null) {
-							req.setResponse(new ContainerNode(allocatedContainer));	
-						}
-					}
-					updatedNodes = allocResp.getUpdatedNodes();
-					List<ContainerStatus> completedContainersStatuses = allocResp.getCompletedContainersStatuses();
-					for (ContainerStatus compContStat : completedContainersStatuses) {
-					  releasedContainers.add(compContStat.getContainerId());
-					}
-					while (outstanding.size() > 0) {
-						inQ.add(outstanding.poll());
-					}
-					String proxyStats = OrcaAppMaster.this.oc.getProxyStats();
-					try {
-					  JSONArray containerStats = new JSONArray(proxyStats);
-					  if (containerStats != null) {
-					    for (int i = 0; i < containerStats.length(); i ++) {
-					      Map stat = (Map)containerStats.get(i);
-					      int inProgress = Integer.parseInt((String)stat.get("outstanding"));
-					      if (inProgress > 1) {
-					        oc.scaleUpBy(1);
-					        break;
-					      }
-					    }
-					  }
-					} catch (Exception e) {
-					  logger.info("Got error while getting container stats <" + proxyStats + ">!!", e);
-					}
-				}
-				try {
-					Thread.sleep(1000);
-				} catch (InterruptedException e) {
-					// Don't care..
-				}
+			  String proxyStats = null;
+			  int lastMax = 0;
+			  try {
+			    proxyStats = OrcaAppMaster.this.oc.getProxyStats();
+			    if (proxyStats != null) {
+			      logger.info("Got container stats <" + proxyStats + ">!!");
+			    }
+			    JSONArray containerStats = new JSONArray(proxyStats);
+			    if (containerStats != null) {
+			      for (int i = 0; i < containerStats.length(); i ++) {
+			        JSONObject stat = (JSONObject)containerStats.get(i);
+			        int inProgress = Integer.parseInt((String)stat.get("outstanding"));
+			        if ((inProgress > 10)&&(inProgress > lastMax)) {
+			          oc.scaleUpBy(1);
+			          lastMax = (inProgress > lastMax) ? inProgress : lastMax;
+			          break;
+			        }
+			      }
+			    }
+			  } catch (Exception e) {
+			    logger.info("Got error while getting container stats <" + proxyStats + ">!!", e);
+			  }
+			  if (inQ.size() != 0) {
+			    LinkedList<ControllerRequest> outstanding = new LinkedList<ControllerRequest>();
+			    inQ.drainTo(outstanding);
+			    List<ContainerRequest> containerReqs = OrcaAppMaster.this.setupContainerAskForRM(outstanding.size(), null);
+			    
+			    // Send request to RM
+			    logger.info("Asking RM for a container !!");
+			    // Retrieve list of allocated containers from the response
+			    AllocateResponse allocResp = null;
+			    try {
+			      allocResp = sendContainerAskToRM(containerReqs);
+			    } catch (Exception e) {
+			      logger.info("Got Error response when sending containerAsk !!", allocResp);
+			    }
+			    logger.info("Got response from RM for container ask, allocatedCnt=" + allocResp.getAllocatedContainers().size());
+			    for (Container allocatedContainer : allocResp.getAllocatedContainers()) {
+			      ControllerRequest req = outstanding.poll();
+			      if (req != null) {
+			        req.setResponse(new ContainerNode(allocatedContainer));	
+			      }
+			    }
+			    List<ContainerStatus> completedContainersStatuses = allocResp.getCompletedContainersStatuses();
+			    for (ContainerStatus compContStat : completedContainersStatuses) {
+			      releasedContainers.add(compContStat.getContainerId());
+			    }
+			    while (outstanding.size() > 0) {
+			      inQ.add(outstanding.poll());
+			    }
+			  }
+			  try {
+			    Thread.sleep(1000);
+			  } catch (InterruptedException e) {
+			    // Don't care..
+			  }
 			}
 			
 		}

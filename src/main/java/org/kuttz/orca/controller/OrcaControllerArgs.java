@@ -17,7 +17,7 @@ public class OrcaControllerArgs {
 	public int numContainers = 3;
 
 	@Parameter(names = "-hb_period", description = "Heartbeat period", required = false)
-	public int hbPeriod = 10000;
+	public int hbPeriod = 1000;
 	
 	@Parameter(names = "-hb_warn_time", description = "Time since last heartbeat for issuing a warning to client", required = false)
 	public int hbWarnTime = 15000;

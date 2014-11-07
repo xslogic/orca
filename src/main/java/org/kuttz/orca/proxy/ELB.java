@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.TreeSet;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.jboss.netty.bootstrap.ServerBootstrap;
 import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
@@ -33,8 +34,8 @@ public class ELB implements Runnable {
     public Map<ELBNode, Stats> nodeStats = new HashMap<ELBNode, Stats>();
     
     static class Stats {
-      public int outstanding;
-      public int total;
+      public AtomicInteger outstanding = new AtomicInteger(0);
+      public AtomicInteger total = new AtomicInteger(0);
     }
 
     public void updateNodeStats() {

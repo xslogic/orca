@@ -51,15 +51,21 @@ public class Proxy implements Runnable, TProxyCommandEndPoint.Iface {
 	}
 
 	public void updateNodeStats() {
-	  Map<ELBNode, Stats> hashedMap = new HashMap<ELBNode, Stats>(orcaELB.nodeStats);
+	  Map<ELBNode, Stats> hashedMap = null;
+	  synchronized (orcaELB.nodeStats) {
+	    hashedMap = new HashMap<ELBNode, Stats>(orcaELB.nodeStats);
+      }
 	  JSONArray jResp = new JSONArray();
 //	  List<Map<String,String>> l = new LinkedList<Map<String, String>>();
 	  for (Map.Entry<ELBNode, Stats> e : hashedMap.entrySet()) {
 	    String node = e.getKey().host + ":" + e.getKey().port;
 	    Map<String, String> nInfo = new HashMap<String, String>();
-	    nInfo.put("node", node);
-	    nInfo.put("outstanding", "" + e.getValue().outstanding);
-	    nInfo.put("total", "" + e.getValue().total);
+	    Stats stats = e.getValue();
+	    synchronized (stats) {
+	      nInfo.put("node", node);
+	      nInfo.put("outstanding", "" + e.getValue().outstanding.get());
+	      nInfo.put("total", "" + e.getValue().total.get());
+        }
 	    jResp.put(nInfo);
 	  }
 	  this.nodeInfo.setInfoJson(jResp.toString());

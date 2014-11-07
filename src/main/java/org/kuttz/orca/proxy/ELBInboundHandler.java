@@ -51,23 +51,24 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 		cb.getPipeline().addLast("handler", new OutboundHandler(e.getChannel()));
 		final ELBNode nextNode = elb.nextNode();
 		logger.info("\nRouting to [" + nextNode + "]\n");
-		Stats stats = elb.nodeStats.get(nextNode);
-		if (stats == null) {
-		  stats = new Stats();
-		  elb.nodeStats.put(nextNode, stats);
-		}
-		stats.outstanding++;
-		stats.total++;
-		elb.updateNodeStats();
+		Stats stats = null;
+		synchronized (elb.nodeStats) {
+		  stats = elb.nodeStats.get(nextNode);
+		  if (stats == null) {
+		    stats = new Stats();
+		    elb.nodeStats.put(nextNode, stats);
+		  }
+        }
 		ChannelFuture f = cb.connect(new InetSocketAddress(nextNode.host, nextNode.port));
 		outboundChannel = f.getChannel();
-		
 		ctx.setAttachment(stats);
-		f.addListener(new ChannelFutureListener() {			
+        elb.updateNodeStats();
+		f.addListener(new ChannelFutureListener() {
 			@Override
 			public void operationComplete(ChannelFuture future) throws Exception {
-	          logger.info("IB Channel operationComplete [" + elb.nodeStats.get(nextNode) + "]");
-			    elb.updateNodeStats();
+			  synchronized (elb.nodeStats) {
+			    logger.info("IB Channel operationComplete [" + elb.nodeStats.get(nextNode) + "]");
+              }
 				if (future.isSuccess()) {
 					inboundChannel.setReadable(true);
 				} else {
@@ -83,6 +84,14 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 	public void messageReceived(ChannelHandlerContext ctx, MessageEvent e)
 			throws Exception {
       logger.info("IB Channel messageReceived [" + ctx.getAttachment() + "]");
+      Object att = ctx.getAttachment();
+      if ((att != null)&&(att instanceof Stats)) {
+        Stats stats = (Stats)att;
+        synchronized (stats) {
+          stats.outstanding.incrementAndGet();
+        }
+      }
+      elb.updateNodeStats();
 		ChannelBuffer msg = (ChannelBuffer) e.getMessage();
 		synchronized (trafficLock) {
 			outboundChannel.write(msg);
@@ -113,6 +122,15 @@ public class ELBInboundHandler extends SimpleChannelUpstreamHandler {
 	@Override
 	public void channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
 			throws Exception {
+	  Object att = ctx.getAttachment();
+	  if ((att != null)&&(att instanceof Stats)) {
+	    Stats stats = (Stats)att;
+	    synchronized (stats) {
+	      stats.outstanding.decrementAndGet();
+	      stats.total.incrementAndGet();
+        }
+	  }
+      elb.updateNodeStats();
       logger.info("IB Channel channelClosed [" + ctx.getAttachment() + "]");
 		if (outboundChannel != null) {
 			closeOnFlush(outboundChannel);
